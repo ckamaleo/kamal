@@ -1,0 +1,129 @@
+Create a table:
+
+CREATE TABLE beers (
+    id      INT PRIMARY KEY,
+    name    VARCHAR(100) NOT NULL,
+    brewery VARCHAR(100) NOT NULL,
+    style   VARCHAR(50) NOT NULL,
+    abv     DECIMAL(4, 2),
+    ounces  INTEGER
+);
+
+Load the data:
+
+WITH data AS (
+  SELECT
+    array['Golden', 'Dark', 'Crisp', 'Bold', 'Smooth', 'Frosty', 'Hoppy', 'Mellow', 'Fiery', 'Rich', 'Bitter', 'Tangy', 'Earthy', 'Spicy', 'Floral'] AS adj_list,
+    array['Dragon', 'Eagle', 'Bear', 'River', 'Mountain', 'Wolf', 'Storm', 'Phoenix', 'Falcon', 'Oak', 'Thunder', 'Vine', 'Horizon', 'Bison', 'Canyon'] AS noun_list,
+    array['BrewHound', 'Sierra Arizona', 'Flounders Brewing', 'Rock Brewing Co', 'Ding''s Brewery', 'Catfish Head', 'Luganitas Brewing', 'Duck Island'] AS brewery_list,
+    array['Ale', 'Pale Ale', 'IPA', 'Porter', 'Stout', 'Lager', 'Pilsner', 'Wheat Beer', 'Saison'] AS style_list
+),
+arrays AS (
+  SELECT
+    array_length(data.adj_list,1)::int AS adj_len,
+    array_length(data.noun_list,1)::int AS noun_len,
+    array_length(data.brewery_list,1)::int AS brewery_len,
+    array_length(data.style_list,1)::int AS style_len
+  FROM data
+)
+INSERT INTO beers (id, name, brewery, style, abv, ounces)
+SELECT
+    i,
+    (data.adj_list[ceil(random() * arrays.adj_len)] || ' ' || data.noun_list[ceil(random() * arrays.noun_len)]) AS name,
+    (data.brewery_list[ceil(random() * arrays.brewery_len)]) AS brewery,
+    (data.style_list[ceil(random() * arrays.style_len)]) AS style,
+    round((random() * 9 + 4)::numeric, 2) AS abv,
+    (array[8, 12, 16, 24, 32])[ceil(random() * 5)]::int AS ounces
+FROM generate_series(1, 1000000) AS s(i), data, arrays;
+
+
+Then run this Python:
+
+```
+import psycopg2
+import random
+from concurrent.futures import ThreadPoolExecutor
+from time import sleep
+
+# Define the update function
+def update_random_row():
+    conn = None
+    cursor = None
+    try:
+        conn = psycopg2.connect(dbname="yugabyte", user="yugabyte", password="", host="localhost", port=5433)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+        UPDATE beers
+        SET ounces = ( ARRAY[8, 12, 16, 24, 32] )[ floor(random() * 5) + 1 ]
+        WHERE id = floor(random()*1000000+1);
+        """)
+        conn.commit()
+        
+        sleep(random.uniform(0, .05))
+        
+        cursor.close()
+        conn.close()
+    except psycopg2.DatabaseError as e:
+        print(f"Database error occurred: {e}")
+        if conn is not None:
+            conn.rollback()
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+with ThreadPoolExecutor(max_workers=40) as executor:
+    futures = [executor.submit(update_random_row) for _ in range(50000)]
+    
+for future in futures:
+    future.result()
+
+print("done!")
+```
+
+
+While it is running go back into database and create and index:
+
+create index on beers(ounces);
+
+this should have more that 1 tablet to work (my env has 3 nodes) - you may want to force split into at least 5.
+You'll see some errors from the Python app about catalog mismatch:
+
+Database error occurred: schema version mismatch for table 000033c3000030008000000000004027: expected 1, got 0
+CONTEXT:  Catalog Version Mismatch: A DDL occurred while processing this query. Try again.
+
+but it should keep running
+Wait a bit for a second round of errors (I think this is the additional phase transition of the index state).
+After that you can kill the Python app and run the SELECT query I posted earlier.
+
+
+yugabyte=# select coalesce(a.ounces, b.ounces) as ounces,
+       table_count, index_count,
+       table_count - index_count as discrepancy
+from (select ounces, count(ounces) table_count from beers group by ounces) a
+full outer join (select ounces, count(ounces) index_count from beers where ounces in (8, 12, 16, 24, 32) group by ounces) b
+on a.ounces = b.ounces
+order by ounces ;
+ ounces | table_count | index_count | discrepancy 
+--------+-------------+-------------+-------------
+      8 |      199822 |      199825 |          -3
+     12 |      199260 |      199261 |          -1
+     16 |      199855 |      199857 |          -2
+     24 |      200335 |      200338 |          -3
+     32 |      200728 |      200731 |          -3
+(5 rows)
+
+
+
+If you create the index with no workload running, it should report 0 issues:
+ ounces | table_count | index_count | discrepancy 
+--------+-------------+-------------+-------------
+      8 |      199822 |      199822 |           0
+     12 |      199260 |      199260 |           0
+     16 |      199855 |      199855 |           0
+     24 |      200335 |      200335 |           0
+     32 |      200728 |      200728 |           0
